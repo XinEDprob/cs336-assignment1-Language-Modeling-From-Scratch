@@ -1,6 +1,15 @@
 import os
+import re
+import logging
 from typing import BinaryIO
+from collections import Counter, defaultdict
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+
+RAW_TEXT_PATH = "/Users/xinshi/Documents_local/cs336/cs336-assignment1-Language-Modeling-From-Scratch/data/TinyStoriesV2-GPT4-valid.txt"
+SPECIAL_TOKENS = ["<|endoftext|>"]
 
 def find_chunk_boundaries(
     file: BinaryIO,
@@ -48,9 +57,10 @@ def find_chunk_boundaries(
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
 
+counts_pairs = defaultdict(int)
 
 ## Usage
-with open(..., "rb") as f:
+with open(RAW_TEXT_PATH, "rb") as f:
     num_processes = 4
     boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
 
@@ -60,3 +70,17 @@ with open(..., "rb") as f:
         f.seek(start)
         chunk = f.read(end - start).decode("utf-8", errors="ignore")
         # Run pre-tokenization on your chunk and store the counts for each pre-token
+        pattern = "|".join(re.escape(tok) for tok in SPECIAL_TOKENS)
+        splitted_chunks = re.split(pattern, chunk)
+        logger.info(f"number of splitted chunks: {len(splitted_chunks)}")
+
+        counts_words = Counter()
+        for splitted_chunk in splitted_chunks:
+            counts_words += Counter(splitted_chunk.split(" "))
+
+        for key, value in counts_words.items():
+            for i in range(len(key)-1):
+                counts_pairs[key[i:i+2]] += value
+        logger.info(f"number of pairs: {len(counts_pairs)}")
+
+    print("end")
