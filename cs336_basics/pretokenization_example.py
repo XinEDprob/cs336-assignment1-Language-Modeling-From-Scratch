@@ -125,7 +125,8 @@ class BPE(Tokenizer):
         return string
     
 
-def counts_pairs_update(counts_pairs: dict[tuple[int, int], int]) -> dict[tuple[int, int], int]:
+# TODO implementation
+def counts_pairs_update():
     raise NotImplementedError
 
 
@@ -152,10 +153,10 @@ def BPE_tokenizer_training(input_path, vocab_size, special_tokens):
                 counts_words += Counter(splitted_chunk.split(" "))
 
             for key, value in counts_words.items():
-                for i in range(len(key)-1):
-                    counts_pairs[key[i:i+2].encode("utf-8")] += value
+                key_bytes = list(key.encode("utf-8"))
+                for i in range(len(key_bytes)-1):
+                    counts_pairs[(key_bytes[i], key_bytes[i+1])] += value
             logger.info(f"number of pairs: {len(counts_pairs)}")
-        # TODO check implementation details???
         f.seek(0)
         indices = list(map(int, f.read()))
 
@@ -165,7 +166,7 @@ def BPE_tokenizer_training(input_path, vocab_size, special_tokens):
     vocab: dict[int, bytes] = {x: bytes([x]) for x in range(256)}
     for i in range(vocab_size - 256):
         if i > 0:
-            counts_pairs_update(counts_pairs)
+            counts_pairs = counts_pairs_update(counts_pairs, pair)
         pair = max(counts_pairs, key=counts_pairs.get)
         new_indice = 256 + i
         indices = merge_tokens(indices, pair, new_indice)
@@ -181,7 +182,7 @@ if __name__ == "__main__":
     special_tokens = SPECIAL_TOKENS
     BPE_params = BPE_tokenizer_training(input_path, vocab_size, special_tokens)
     
-    data = {
+    BPE_params_data = {
         "vocab": {str(k): base64.b64encode(v).decode("ascii") for k, v in BPE_params.vocab.items()},
         "merges": [[base64.b64encode(a).decode("ascii"), base64.b64encode(b).decode("ascii")] for a, b in BPE_params.merges]
     }
@@ -191,7 +192,7 @@ if __name__ == "__main__":
     with open(f"{TRAINED_BPE_PICKLE}", "wb") as f:
         pickle.dump(BPE_params, f)
     
-    # with open(f"{TRAINED_BPE_JSON}", "wb") as f:
-    #     json.dump(BPE_params, f)
+    with open(f"{TRAINED_BPE_JSON}", "wb") as f:
+        json.dump(BPE_params_data, f)
 
     print("end")
