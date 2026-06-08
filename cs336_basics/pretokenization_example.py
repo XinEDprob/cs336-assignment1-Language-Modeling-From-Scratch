@@ -1,5 +1,5 @@
 import os
-import re
+import regex as re
 import logging
 from typing import BinaryIO
 from collections import Counter, defaultdict
@@ -13,27 +13,27 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger(__name__)
 
 
-RAW_TEXT_FOLDER_PATH = "/Users/xinshi/Documents_local/cs336/cs336-assignment1-Language-Modeling-From-Scratch/data"
+RAW_TEXT_FOLDER_PATH = "/Users/xshi849/Documents/playground/cs336-assignment1-Language-Modeling-From-Scratch/data"
 RAW_TEXT_NAME = "TinyStoriesV2-GPT4-valid.txt"
 RAW_TEXT_PATH = RAW_TEXT_FOLDER_PATH + "/" + RAW_TEXT_NAME
 
-TRAINED_DATA_FOLDER = "/Users/xinshi/Documents_local/cs336/cs336-assignment1-Language-Modeling-From-Scratch/trained"
+TRAINED_DATA_FOLDER = "/Users/xshi849/Documents/playground/cs336-assignment1-Language-Modeling-From-Scratch/trained"
 TRAINED_BPE_PICKLE = TRAINED_DATA_FOLDER + "/" + RAW_TEXT_NAME.split(".")[0] + "_trained_BPE_pickle"
 TRAINED_BPE_JSON = TRAINED_DATA_FOLDER + "/" + RAW_TEXT_NAME.split(".")[0] + "_trained_BPE_json"
 
 
 SPECIAL_TOKENS = ["<|endoftext|>"]
-
+PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
 class Tokenizer(ABC):
 
     @abstractmethod
     def encode(self, string: str) -> list[int]:
-        return NotImplementedError
+        raise NotImplementedError
     
     @abstractmethod
-    def decode(self, string: str) -> list[int]:
-        return NotImplementedError
+    def decode(self, indices: list[int]) -> str:
+        raise NotImplementedError
 
 
 def find_chunk_boundaries(
@@ -89,18 +89,18 @@ class BPETokenizerParams():
     merges: list[tuple[bytes, bytes]]
 
 
-def merge_tokens(indices: list[int], pair: list[int, int], new_indice: int) -> list[int]:
+def merge_tokens(vocab: dict[int, bytes], indices: list[int], pair: list[bytes, bytes], new_indice: int) -> list[int]:
     # Implement logic to merge two tokens into a new token
     new_indices = []
     n = len(indices)
     i = 0
-    while i < n-1:
-        if i+1 < n and indices[i] == pair[0] and indices[i+1] == pair[1]:
-            i += 2
+    while i < n:
+        if i+1 < n and vocab[indices[i]] == pair[0] and vocab[indices[i+1]] == pair[1]:
             new_indices.append(new_indice)
+            i += 2
         else:
-            i += 1
             new_indices.append(indices[i])
+            i += 1
     return new_indices
 
 
@@ -111,8 +111,9 @@ class BPE(Tokenizer):
     def encode(self, string: str) -> list[int]:
         # Implement BPE encoding logic here
         indices = list(map(int, string.encode("utf-8")))
-        for pair, new_indice in self.params.merges.items():
-            indices = merge_tokens(indices, pair, new_indice)
+        for pair in self.params.merges:
+            new_indice = 256 + self.params.merges.index(pair)
+            indices = merge_tokens(self.params.vocab, indices, pair, new_indice)
         return indices
         
 
@@ -121,20 +122,63 @@ class BPE(Tokenizer):
         bytes_list = []
         for indice in indices:
             bytes_list.append(self.params.vocab.get(indice))
-        string = b"".join(bytes_list).decode("uft-8")
+        string = b"".join(bytes_list).decode("utf-8")
         return string
     
 
-# TODO implementation
-def counts_pairs_update():
-    raise NotImplementedError
+def counts_pairs_update(words_tokens: dict[str, list[int]],
+                        counts_words: dict[str, int],
+                        pairs_to_words: dict[tuple[bytes, bytes], set[str]], 
+                        counts_pairs: dict[tuple[bytes, bytes], int], 
+                        vocab: dict[int, bytes],
+                        pair: tuple[bytes, bytes],
+                        new_indice: int):
+    del counts_pairs[pair]
+
+    words_list = pairs_to_words[pair]
+    pair0_bytes, pair1_bytes = pair
+    # pair0, pair1 = int(pair0_bytes), int(pair1_bytes)
+    new_bytes = pair0_bytes + pair1_bytes
+    for word in words_list:
+        tokens = words_tokens[word]
+        new_tokens = []
+        i = 0
+        while i < len(tokens)-1:
+            if vocab[tokens[i]] == pair0_bytes and vocab[tokens[i+1]] == pair1_bytes:
+                if i > 0:
+                    remove_pair = tuple([vocab[tokens[i-1]], pair0_bytes])
+                    if remove_pair in counts_pairs:
+                        counts_pairs[remove_pair] -= counts_words[word]
+                    add_pair = tuple([vocab[tokens[i-1]], new_bytes])
+                    counts_pairs[add_pair] += counts_words[word]
+                    pairs_to_words[remove_pair].discard(word)
+                    pairs_to_words[add_pair].add(word)
+                    
+                if i < len(tokens)-2:
+                    remove_pair = tuple([pair1_bytes, vocab[tokens[i+2]]])
+                    if remove_pair in counts_pairs:
+                        counts_pairs[remove_pair] -= counts_words[word]
+                    add_pair = tuple([new_bytes, vocab[tokens[i+2]]])
+                    counts_pairs[add_pair] += counts_words[word] 
+                    pairs_to_words[remove_pair].discard(word)
+                    pairs_to_words[add_pair].add(word)
+                new_tokens.append(new_indice)
+                i += 2
+            else:
+                new_tokens.append(tokens[i])
+                i += 1
+        if i == len(tokens)-1:
+            new_tokens.append(tokens[i])
+        words_tokens[word] = new_tokens                   
 
 
 def BPE_tokenizer_training(input_path, vocab_size, special_tokens):
     counts_pairs = defaultdict(int)
-
+    pairs_to_words = defaultdict(set)
+    words_tokens = defaultdict(list)
+    counts_words = Counter()
     ## Usage
-    with open(RAW_TEXT_PATH, "rb") as f:
+    with open(input_path, "rb") as f:
         num_processes = 4
         boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
 
@@ -148,15 +192,18 @@ def BPE_tokenizer_training(input_path, vocab_size, special_tokens):
             splitted_chunks = re.split(pattern, chunk)
             logger.info(f"number of splitted chunks: {len(splitted_chunks)}")
 
-            counts_words = Counter()
             for splitted_chunk in splitted_chunks:
-                counts_words += Counter(splitted_chunk.split(" "))
+                # counts_words += Counter(splitted_chunk.split(" "))
+                counts_words += Counter(re.findall(PAT, splitted_chunk))
 
-            for key, value in counts_words.items():
-                key_bytes = list(key.encode("utf-8"))
-                for i in range(len(key_bytes)-1):
-                    counts_pairs[(key_bytes[i], key_bytes[i+1])] += value
-            logger.info(f"number of pairs: {len(counts_pairs)}")
+        for key, value in counts_words.items():
+            key_bytes = list(key.encode("utf-8"))
+            words_tokens[key] = key_bytes
+            for i in range(len(key_bytes)-1):
+                pairs = (bytes([key_bytes[i]]), bytes([key_bytes[i+1]]))
+                counts_pairs[pairs] += value
+                pairs_to_words[pairs].add(key)
+        logger.info(f"number of pairs: {len(counts_pairs)}")
         f.seek(0)
         indices = list(map(int, f.read()))
 
@@ -166,19 +213,20 @@ def BPE_tokenizer_training(input_path, vocab_size, special_tokens):
     vocab: dict[int, bytes] = {x: bytes([x]) for x in range(256)}
     for i in range(vocab_size - 256):
         if i > 0:
-            counts_pairs = counts_pairs_update(counts_pairs, pair)
+            counts_pairs_update(words_tokens, counts_words, pairs_to_words, counts_pairs, vocab, pair, new_indice)
         pair = max(counts_pairs, key=counts_pairs.get)
         new_indice = 256 + i
-        indices = merge_tokens(indices, pair, new_indice)
-        vocab[new_indice] = vocab[pair[0]] + vocab[pair[1]]
+        indices = merge_tokens(vocab, indices, pair, new_indice)
+        vocab[new_indice] = pair[0] + pair[1]
         merges.append(pair)
+        logger.info(f"iteration {i}, pair: {pair}, count: {counts_pairs[pair]}")
 
     return BPETokenizerParams(vocab=vocab, merges=merges)
 
 
 if __name__ == "__main__":
     input_path = RAW_TEXT_PATH
-    vocab_size = 2560
+    vocab_size = 266
     special_tokens = SPECIAL_TOKENS
     BPE_params = BPE_tokenizer_training(input_path, vocab_size, special_tokens)
     
@@ -192,7 +240,7 @@ if __name__ == "__main__":
     with open(f"{TRAINED_BPE_PICKLE}", "wb") as f:
         pickle.dump(BPE_params, f)
     
-    with open(f"{TRAINED_BPE_JSON}", "wb") as f:
+    with open(f"{TRAINED_BPE_JSON}", "w") as f:
         json.dump(BPE_params_data, f)
 
     print("end")
