@@ -1,3 +1,4 @@
+from heapq import merge
 import json
 import time
 
@@ -47,6 +48,12 @@ def test_train_bpe():
             )
             for merge_token_1, merge_token_2 in gpt2_reference_merges
         ]
+
+    # print(f"Learned merges: {merges}")
+    # print(f"Reference merges: {reference_merges}")
+    # for i in range(len(merges)):
+    #     if merges[i] != reference_merges[i]:
+    #         print(f"row {i} -- merge: {merges[i]} --- reference_merges: {reference_merges[i]}")
     assert merges == reference_merges
 
     # Compare the vocab to the expected output vocab

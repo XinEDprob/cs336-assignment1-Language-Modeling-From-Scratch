@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 import pickle
 import json
 import base64
+from copy import deepcopy
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -107,12 +108,13 @@ def merge_tokens(vocab: dict[int, bytes], indices: list[int], pair: list[bytes, 
 class BPE(Tokenizer):
     def __init__(self, params:BPETokenizerParams):
         self.params = params
+        self.reverse_vocab = {v: k for k, v in self.params.vocab.items()}
 
     def encode(self, string: str) -> list[int]:
         # Implement BPE encoding logic here
         indices = list(map(int, string.encode("utf-8")))
         for pair in self.params.merges:
-            new_indice = 256 + self.params.merges.index(pair)
+            new_indice = 256 + self.reverse_vocab[pair]
             indices = merge_tokens(self.params.vocab, indices, pair, new_indice)
         return indices
         
@@ -135,7 +137,7 @@ def counts_pairs_update(words_tokens: dict[str, list[int]],
                         new_indice: int):
     del counts_pairs[pair]
 
-    words_list = pairs_to_words[pair]
+    words_list = deepcopy(pairs_to_words[pair])
     pair0_bytes, pair1_bytes = pair
     # pair0, pair1 = int(pair0_bytes), int(pair1_bytes)
     new_bytes = pair0_bytes + pair1_bytes
@@ -162,6 +164,7 @@ def counts_pairs_update(words_tokens: dict[str, list[int]],
                     counts_pairs[add_pair] += counts_words[word] 
                     pairs_to_words[remove_pair].discard(word)
                     pairs_to_words[add_pair].add(word)
+                tokens[i+1] = new_indice
                 new_tokens.append(new_indice)
                 i += 2
             else:
@@ -169,7 +172,14 @@ def counts_pairs_update(words_tokens: dict[str, list[int]],
                 i += 1
         if i == len(tokens)-1:
             new_tokens.append(tokens[i])
-        words_tokens[word] = new_tokens                   
+        words_tokens[word] = new_tokens
+        # Re-add word to pairs_to_words for all pairs that still exist in new_tokens.
+        # This corrects premature discards: when processing one occurrence of a pair
+        # (e.g. (o,n) in 'condition'), the discard removes the word from
+        # pairs_to_words for that pair even if another occurrence remains elsewhere.
+        for j in range(len(new_tokens) - 1):
+            remaining = (vocab[new_tokens[j]], vocab[new_tokens[j + 1]])
+            pairs_to_words[remaining].add(word)                   
 
 
 def BPE_tokenizer_training(input_path, vocab_size, special_tokens):
@@ -211,11 +221,15 @@ def BPE_tokenizer_training(input_path, vocab_size, special_tokens):
     assert vocab_size >= 256, "vocab should be >= 256"
     merges: list[tuple[bytes, bytes]] = []
     vocab: dict[int, bytes] = {x: bytes([x]) for x in range(256)}
-    for i in range(vocab_size - 256):
+    next_id = 256
+    for token in special_tokens:
+        vocab[next_id] = token.encode("utf-8")
+        next_id += 1
+    for i in range(vocab_size - 256 - len(special_tokens)):
         if i > 0:
             counts_pairs_update(words_tokens, counts_words, pairs_to_words, counts_pairs, vocab, pair, new_indice)
-        pair = max(counts_pairs, key=counts_pairs.get)
-        new_indice = 256 + i
+        pair = max(counts_pairs, key= lambda x: (counts_pairs[x], x))
+        new_indice = 256 + len(special_tokens) + i
         indices = merge_tokens(vocab, indices, pair, new_indice)
         vocab[new_indice] = pair[0] + pair[1]
         merges.append(pair)
@@ -225,8 +239,9 @@ def BPE_tokenizer_training(input_path, vocab_size, special_tokens):
 
 
 if __name__ == "__main__":
-    input_path = RAW_TEXT_PATH
-    vocab_size = 266
+    # input_path = RAW_TEXT_PATH
+    input_path = "/Users/xshi849/Documents/playground/cs336-assignment1-Language-Modeling-From-Scratch/tests/fixtures/corpus.en"
+    vocab_size = 500
     special_tokens = SPECIAL_TOKENS
     BPE_params = BPE_tokenizer_training(input_path, vocab_size, special_tokens)
     
@@ -242,5 +257,3 @@ if __name__ == "__main__":
     
     with open(f"{TRAINED_BPE_JSON}", "w") as f:
         json.dump(BPE_params_data, f)
-
-    print("end")
