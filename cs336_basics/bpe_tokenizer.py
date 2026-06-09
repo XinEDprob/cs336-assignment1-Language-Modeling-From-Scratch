@@ -1,11 +1,10 @@
 import logging
-from collections import defaultdict
-import string
 from typing import Iterator
-from cs336_basics.bpe_tokenizer_training import SPECIAL_TOKENS, PAT, merge_tokens 
+from cs336_basics.bpe_tokenizer_training import SPECIAL_TOKENS, PAT, merge_tokens
 from abc import ABC, abstractmethod
 import pickle
 import regex as re
+import json
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -16,82 +15,77 @@ class Tokenizer(ABC):
     @abstractmethod
     def encode(self, string: str) -> list[int]:
         raise NotImplementedError
-    
+
     @abstractmethod
     def decode(self, indices: list[int]) -> str:
         raise NotImplementedError
-    
+
 
 class BPE_Tokenizer(Tokenizer):
     def __init__(self, vocab, merges, special_tokens=None):
         self.vocab = vocab
         self.merges = merges
         self.reverse_vocab = {v: k for k, v in self.vocab.items()}
-        if special_tokens:
-            self.special_tokens = special_tokens
-        else:
-            self.special_tokens = SPECIAL_TOKENS
+        self.special_tokens = special_tokens if special_tokens is not None else []
+        # Cache merged token IDs so we don't recompute on every encode() call
+        self._merge_ids = [self.reverse_vocab[p[0] + p[1]] for p in self.merges]
 
     def encode(self, text: str) -> list[int]:
-        pattern = "|".join(re.escape(tok) for tok in self.special_tokens)
-        splitted_chunks = re.split(pattern, text)
-        # Implement BPE encoding logic here
-        pretokens = []
-        for splitted_chunk in splitted_chunks:
-            # counts_words += Counter(splitted_chunk.split(" "))
-            words = re.findall(PAT, splitted_chunk)
-            for word in words:
-                word_bytes = word.encode("utf-8")
-                word_tokens = []
-                for i in range(len(word_bytes)):
-                    word_tokens.append(self.reverse_vocab[bytes([word_bytes[i]])])
-                pretokens.append(word_tokens)
-        for i in range(len(pretokens)):
-            for pair in self.merges:
-                new_indice = self.reverse_vocab[pair[0] + pair[1]]
-                pretokens[i] = merge_tokens(self.vocab, pretokens[i], pair, new_indice)
-        pretokens_flat = [token for sublist in pretokens for token in sublist]
-        return pretokens_flat
-        
+        token_ids = []
+
+        if self.special_tokens:
+            # Sort longest-first so overlapping tokens (e.g. "aa" before "a") match correctly
+            sorted_special = sorted(self.special_tokens, key=len, reverse=True)
+            pattern = "|".join(re.escape(tok) for tok in sorted_special)
+            # Capturing group keeps the delimiters in the split result
+            chunks = re.split(f"({pattern})", text)
+        else:
+            chunks = [text]
+
+        special_token_set = set(self.special_tokens)
+
+        for chunk in chunks:
+            if not chunk:
+                continue
+            if chunk in special_token_set:
+                # Emit the special token as a single token ID
+                token_ids.append(self.reverse_vocab[chunk.encode("utf-8")])
+            else:
+                # Regular text: pre-tokenise with the GPT-2 regex, then apply BPE merges
+                pretokens = []
+                for word in re.findall(PAT, chunk):
+                    word_bytes = word.encode("utf-8")
+                    word_tokens = [self.reverse_vocab[bytes([b])] for b in word_bytes]
+                    pretokens.append(word_tokens)
+                for i in range(len(pretokens)):
+                    for pair, new_id in zip(self.merges, self._merge_ids):
+                        pretokens[i] = merge_tokens(self.vocab, pretokens[i], pair, new_id)
+                for sublist in pretokens:
+                    token_ids.extend(sublist)
+
+        return token_ids
 
     def decode(self, indices: list[int]) -> str:
-        # Implement BPE decoding logic here
-        # print(f"indices: {indices}")
-        # print(f"vocab: {self.vocab[indices[0]]}")
-        bytes_list = []
-        for indice in indices:
-            bytes_list.append(self.vocab.get(indice))
-        # string = b"".join(bytes_list).decode("utf-8")
-        # print(f"bytes_list: {bytes_list}")
-        string = b"".join(bytes_list).decode("utf-8", errors="ignore")
-        return string
-    
-    @classmethod
-    def from_files(cls, vocab_filepath, merges_filepath, special_tokens=None):
-        with open(vocab_filepath, "rb") as f:
-            cls.vocab = pickle.load(f)
-        with open(merges_filepath, "rb") as f:
-            cls.merges = pickle.load(f)
-        if special_tokens:
-            cls.special_tokens = special_tokens
+        return b"".join(self.vocab[i] for i in indices).decode("utf-8", errors="replace")
+
+    def encode_iterable(self, iterable: Iterator[str]) -> Iterator[int]:
+        for line in iterable:
+            yield from self.encode(line)
 
     @classmethod
     def from_files(cls, BPE_params_filepath, special_tokens=None):
         with open(BPE_params_filepath, "rb") as f:
             BPE_params = pickle.load(f)
-            cls.vocab = BPE_params.vocab
-            cls.merges = BPE_params.merges
-        if special_tokens:
-            cls.special_tokens = special_tokens
-        else:
-            cls.special_tokens = SPECIAL_TOKENS
+        return cls(BPE_params.vocab, BPE_params.merges, special_tokens)
+    
 
-    def encode_iterable(self, iterable: Iterator[str]) -> Iterator[int]: 
-        indices = list(map(int, iterable.encode("utf-8")))
-        for pair in self.merges:
-            new_indice = 256 + self.reverse_vocab[pair]
-            indices = merge_tokens(self.vocab, indices, pair, new_indice)
-        yield indices
+    @classmethod
+    def from_files_text(cls, vocab_filepath, merges_filepath, special_tokens=None):
+        with open(vocab_filepath, encoding="utf-8") as f:
+            vocab = json.load(f)
+        with open(merges_filepath, encoding="utf-8") as f:
+            merges = [tuple(line.rstrip().split(" ")) for line in f]
+        return cls(vocab, merges, special_tokens)
 
     
 
