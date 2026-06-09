@@ -26,16 +26,6 @@ TRAINED_BPE_JSON = TRAINED_DATA_FOLDER + "/" + RAW_TEXT_NAME.split(".")[0] + "_t
 SPECIAL_TOKENS = ["<|endoftext|>"]
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
-class Tokenizer(ABC):
-
-    @abstractmethod
-    def encode(self, string: str) -> list[int]:
-        raise NotImplementedError
-    
-    @abstractmethod
-    def decode(self, indices: list[int]) -> str:
-        raise NotImplementedError
-
 
 def find_chunk_boundaries(
     file: BinaryIO,
@@ -90,7 +80,7 @@ class BPETokenizerParams():
     merges: list[tuple[bytes, bytes]]
 
 
-def merge_tokens(vocab: dict[int, bytes], indices: list[int], pair: list[bytes, bytes], new_indice: int) -> list[int]:
+def merge_tokens(vocab: dict[int, bytes], indices: list[int], pair: tuple[bytes, bytes], new_indice: int) -> list[int]:
     # Implement logic to merge two tokens into a new token
     new_indices = []
     n = len(indices)
@@ -104,29 +94,6 @@ def merge_tokens(vocab: dict[int, bytes], indices: list[int], pair: list[bytes, 
             i += 1
     return new_indices
 
-
-class BPE(Tokenizer):
-    def __init__(self, params:BPETokenizerParams):
-        self.params = params
-        self.reverse_vocab = {v: k for k, v in self.params.vocab.items()}
-
-    def encode(self, string: str) -> list[int]:
-        # Implement BPE encoding logic here
-        indices = list(map(int, string.encode("utf-8")))
-        for pair in self.params.merges:
-            new_indice = 256 + self.reverse_vocab[pair]
-            indices = merge_tokens(self.params.vocab, indices, pair, new_indice)
-        return indices
-        
-
-    def decode(self, indices: list[int]) -> str:
-        # Implement BPE decoding logic here
-        bytes_list = []
-        for indice in indices:
-            bytes_list.append(self.params.vocab.get(indice))
-        string = b"".join(bytes_list).decode("utf-8")
-        return string
-    
 
 def counts_pairs_update(words_tokens: dict[str, list[int]],
                         counts_words: dict[str, int],

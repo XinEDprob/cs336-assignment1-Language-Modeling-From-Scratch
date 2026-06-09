@@ -57,6 +57,7 @@ def get_tokenizer_from_vocab_merges_path(
         gpt2_vocab_index: bytes([gpt2_byte_decoder[token] for token in gpt2_vocab_item])
         for gpt2_vocab_item, gpt2_vocab_index in gpt2_vocab.items()
     }
+    # print(f"unit test vocab: {vocab[115]}")
     # If any of the special tokens don't exist in the vocab, append them to the vocab.
     if special_tokens:
         for special_token in special_tokens:
