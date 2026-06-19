@@ -8,7 +8,9 @@ import numpy.typing as npt
 import torch
 from cs336_basics.bpe_tokenizer_training import BPE_tokenizer_training
 from cs336_basics.bpe_tokenizer import BPE_Tokenizer
-from cs336_basics.transformer import LinearTransform, Embedding, RMSNorm, SwiGLU, ROPE
+from cs336_basics.transformer import LinearTransform, Embedding, RMSNorm, SwiGLU, ROPE, \
+                                     softmax, scaled_dot_product_attention, \
+                                     CausalMultiHeadSelfAttention, TransformerBlock, Transformer
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
@@ -112,7 +114,7 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    return scaled_dot_product_attention(Q, K, V, mask)
 
 
 def run_multihead_self_attention(
@@ -146,7 +148,12 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    causal_multihead_self_attention = CausalMultiHeadSelfAttention(d_model=d_model, num_heads=num_heads, max_seq_len=in_features.shape[-3], theta=10000.0)
+    causal_multihead_self_attention.load_state_dict({"weight_q": q_proj_weight, "weight_k": k_proj_weight,
+                                                     "weight_v": v_proj_weight, 
+                                                     "output_proj.weight": o_proj_weight})
+    
+    return causal_multihead_self_attention(in_features, token_positions=None)
 
 
 def run_multihead_self_attention_with_rope(
@@ -186,8 +193,13 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
-
+    # _, sequence_length, d_model = in_features
+    causal_multihead_self_attention = CausalMultiHeadSelfAttention(d_model=d_model, num_heads=num_heads, max_seq_len=max_seq_len, theta=theta)
+    causal_multihead_self_attention.load_state_dict({"weight_q": q_proj_weight, "weight_k": k_proj_weight,
+                                                     "weight_v": v_proj_weight, 
+                                                     "output_proj.weight": o_proj_weight})
+    
+    return causal_multihead_self_attention(in_features, token_positions=token_positions)
 
 def run_rope(
     d_k: int,
@@ -282,7 +294,20 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    block = TransformerBlock(d_model=d_model, num_heads=num_heads, d_ff=d_ff, max_seq_len=max_seq_len, theta=theta)
+    key_map = {
+        "attn.q_proj.weight": "attn.weight_q",
+        "attn.k_proj.weight": "attn.weight_k",
+        "attn.v_proj.weight": "attn.weight_v",
+        "attn.output_proj.weight": "attn.output_proj.weight",
+        "ln1.weight": "ln1.g",
+        "ln2.weight": "ln2.g",
+        "ffn.w1.weight": "ffn.linear1.weight",
+        "ffn.w2.weight": "ffn.linear3.weight",
+        "ffn.w3.weight": "ffn.linear2.weight",
+    }
+    block.load_state_dict({key_map[k]: v for k, v in weights.items()})
+    return block(in_features)
 
 
 def run_transformer_lm(
@@ -364,7 +389,30 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    model = Transformer(
+        d_model=d_model, num_heads=num_heads, d_ff=d_ff,
+        context_length=context_length, theta=rope_theta,
+        vocab_size=vocab_size, num_layers=num_layers,
+    )
+    def remap(k):
+        replacements = [
+            ("token_embeddings.weight", "token_embeddings.embeddings"),
+            (".attn.q_proj.weight",     ".attn.weight_q"),
+            (".attn.k_proj.weight",     ".attn.weight_k"),
+            (".attn.v_proj.weight",     ".attn.weight_v"),
+            (".ln1.weight",             ".ln1.g"),
+            (".ln2.weight",             ".ln2.g"),
+            ("ln_final.weight",         "ln_final.g"),
+            (".ffn.w1.weight",          ".ffn.linear1.weight"),
+            (".ffn.w2.weight",          ".ffn.linear3.weight"),
+            (".ffn.w3.weight",          ".ffn.linear2.weight"),
+        ]
+        for old, new in replacements:
+            if old in k:
+                return k.replace(old, new)
+        return k
+    model.load_state_dict({remap(k): v for k, v in weights.items()})
+    return model(in_indices)
 
 
 def run_rmsnorm(
@@ -443,7 +491,7 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    return softmax(in_features, dim)
 
 
 def run_cross_entropy(
