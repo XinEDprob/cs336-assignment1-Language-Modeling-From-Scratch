@@ -4,7 +4,6 @@ import logging
 from typing import BinaryIO
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from abc import ABC, abstractmethod
 import pickle
 import json
 import base64
@@ -217,6 +216,9 @@ if __name__ == "__main__":
         "merges": [[base64.b64encode(a).decode("ascii"), base64.b64encode(b).decode("ascii")] for a, b in BPE_params.merges]
     }
 
+    vocab = BPE_params.vocab
+    merges = BPE_params.merges
+
     if not os.path.isdir(TRAINED_DATA_FOLDER):
         os.mkdir(TRAINED_DATA_FOLDER)
     with open(f"{TRAINED_BPE_PICKLE}", "wb") as f:
@@ -224,3 +226,25 @@ if __name__ == "__main__":
     
     with open(f"{TRAINED_BPE_JSON}", "w") as f:
         json.dump(BPE_params_data, f)
+
+    # tokenize the whole text and save the tokenized version as a pickle file
+    with open(input_path, "rb") as f:
+        text = f.read().decode("utf-8", errors="ignore")
+        pattern = "|".join(re.escape(tok) for tok in SPECIAL_TOKENS)
+        splitted_chunks = re.split(pattern, text)
+        tokens = []
+        for splitted_chunk in splitted_chunks:
+            pretokens = []
+            for word in re.findall(PAT, splitted_chunk):
+                word_bytes = word.encode("utf-8")
+                word_tokens = [k for k in word_bytes]
+                pretokens.append(word_tokens)
+            for i in range(len(pretokens)):
+                for pair, new_id in zip(merges, range(256 + len(special_tokens), vocab_size)):
+                    pretokens[i] = merge_tokens(vocab, pretokens[i], pair, new_id)
+            tokens.extend([vocab[k] for pretoken in pretokens for k in pretoken])
+
+    # with open(f"{TRAINED_DATA_FOLDER}/{RAW_TEXT_NAME.split('.')[0]}_tokenized.pkl", "wb") as f:
+    #     pickle.dump(tokens, f)
+
+    print("BPE tokenizer training completed and saved to disk.")
