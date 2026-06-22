@@ -180,3 +180,9 @@ class Transformer(torch.nn.Module):
         x = self.ln_final(x)
         return self.lm_head(x)
     
+
+def cross_entropy(pred_logits, targets):
+    shifted = pred_logits - torch.max(pred_logits, dim=-1, keepdim=True).values
+    log_sum_exp = torch.log(torch.sum(torch.exp(shifted), dim=-1))
+    target_logit = shifted[torch.arange(shifted.shape[0]), targets]
+    return (-target_logit + log_sum_exp).mean()
