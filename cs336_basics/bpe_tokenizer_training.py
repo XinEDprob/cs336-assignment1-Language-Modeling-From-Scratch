@@ -207,25 +207,29 @@ def BPE_tokenizer_training(input_path, vocab_size, special_tokens):
 if __name__ == "__main__":
     # input_path = RAW_TEXT_PATH
     input_path = "/Users/xshi849/Documents/playground/cs336-assignment1-Language-Modeling-From-Scratch/tests/fixtures/corpus.en"
+    DATASET_NAME = input_path.split("/")[-1].split(".")[0]
     vocab_size = 500
     special_tokens = SPECIAL_TOKENS
     BPE_params = BPE_tokenizer_training(input_path, vocab_size, special_tokens)
     
-    BPE_params_data = {
-        "vocab": {str(k): base64.b64encode(v).decode("ascii") for k, v in BPE_params.vocab.items()},
-        "merges": [[base64.b64encode(a).decode("ascii"), base64.b64encode(b).decode("ascii")] for a, b in BPE_params.merges]
-    }
-
     vocab = BPE_params.vocab
     merges = BPE_params.merges
 
     if not os.path.isdir(TRAINED_DATA_FOLDER):
         os.mkdir(TRAINED_DATA_FOLDER)
-    with open(f"{TRAINED_BPE_PICKLE}", "wb") as f:
+    with open(f"{TRAINED_DATA_FOLDER}/{DATASET_NAME}_bpe.pkl", "wb") as f:
         pickle.dump(BPE_params, f)
-    
-    with open(f"{TRAINED_BPE_JSON}", "w") as f:
-        json.dump(BPE_params_data, f)
+
+    # Human-readable vocab: token string → id
+    vocab_readable = {id: token.decode("utf-8", "replace") for id, token in vocab.items()}
+    with open(f"{TRAINED_DATA_FOLDER}/{DATASET_NAME}_vocab.json", "w", encoding="utf-8") as f:
+        json.dump(vocab_readable, f, ensure_ascii=False, indent=2)
+
+    # Human-readable merges: GPT-2 style, one merge per line
+    with open(f"{TRAINED_DATA_FOLDER}/{DATASET_NAME}_merges.txt", "w", encoding="utf-8") as f:
+        f.write("#version: 1.0\n")
+        for a, b in merges:
+            f.write(f"{a.decode('utf-8', 'replace')} {b.decode('utf-8', 'replace')}\n")
 
     # tokenize the whole text and save the tokenized version as a pickle file
     with open(input_path, "rb") as f:
@@ -244,7 +248,7 @@ if __name__ == "__main__":
                     pretokens[i] = merge_tokens(vocab, pretokens[i], pair, new_id)
             tokens.extend([vocab[k] for pretoken in pretokens for k in pretoken])
 
-    # with open(f"{TRAINED_DATA_FOLDER}/{RAW_TEXT_NAME.split('.')[0]}_tokenized.pkl", "wb") as f:
+    # with open(f"{TRAINED_DATA_FOLDER}/{DATASET_NAME}_tokenized.pkl", "wb") as f:
     #     pickle.dump(tokens, f)
 
     print("BPE tokenizer training completed and saved to disk.")
