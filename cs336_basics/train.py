@@ -166,6 +166,60 @@ def load_checkpoint(
     return iteration
 
 
+@torch.no_grad()
+def generate(
+    model: Transformer,
+    prompt_tokens: list[int],
+    max_new_tokens: int,
+    context_length: int,
+    device: str,
+    temperature: float = 1.0,
+    top_k: int | None = None,
+) -> list[int]:
+    """Auto-regressively generate tokens from a prompt.
+
+    Args:
+        model: Trained Transformer model.
+        prompt_tokens: List of token ids representing the prompt.
+        max_new_tokens: Number of new tokens to generate.
+        context_length: Maximum context window of the model.
+        device: Device string (e.g. "cpu" or "cuda").
+        temperature: Softmax temperature. Lower = more greedy; 1.0 = standard sampling.
+        top_k: If set, only sample from the top-k most likely tokens at each step.
+
+    Returns:
+        The original prompt tokens extended with the generated tokens.
+    """
+    model.eval()
+    tokens = list(prompt_tokens)
+
+    for _ in range(max_new_tokens):
+        # Truncate to the last `context_length` tokens so the model never
+        # receives a sequence longer than it was trained on.
+        context = tokens[-context_length:]
+        x: torch.Tensor = torch.tensor([context], dtype=torch.long, device=device)  # (1, T)
+
+        logits = model(x)          # (1, T, vocab_size)
+        next_logits = logits[0, -1, :]  # (vocab_size,) — last position only
+
+        if temperature == 0.0:
+            # Greedy decoding
+            next_token = int(next_logits.argmax())
+        else:
+            next_logits = next_logits / temperature
+            if top_k is not None:
+                # Zero out all logits outside the top-k
+                top_values, _ = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
+                threshold = top_values[-1]
+                next_logits = next_logits.masked_fill(next_logits < threshold, float("-inf"))
+            probs = torch.softmax(next_logits, dim=-1)
+            next_token = int(torch.multinomial(probs, num_samples=1))
+
+        tokens.append(next_token)
+
+    return tokens
+
+
 def train(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------ device
     if args.device is None:
