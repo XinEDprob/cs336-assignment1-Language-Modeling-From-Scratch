@@ -6,15 +6,16 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 import pickle
 import json
-import base64
-from copy import deepcopy
+import heapq
+import multiprocessing
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
 RAW_TEXT_FOLDER_PATH = "/Users/xshi849/Documents/playground/cs336-assignment1-Language-Modeling-From-Scratch/data"
-RAW_TEXT_NAME = "TinyStoriesV2-GPT4-valid.txt"
+# RAW_TEXT_NAME = "TinyStoriesV2-GPT4-train.txt"
+RAW_TEXT_NAME = "owt_valid.txt"
 RAW_TEXT_PATH = RAW_TEXT_FOLDER_PATH + "/" + RAW_TEXT_NAME
 
 TRAINED_DATA_FOLDER = "/Users/xshi849/Documents/playground/cs336-assignment1-Language-Modeling-From-Scratch/trained"
@@ -73,6 +74,21 @@ def find_chunk_boundaries(
     return sorted(set(chunk_boundaries))
 
 
+def _count_words_in_chunk(args: tuple) -> Counter:
+    """Worker: count pre-token frequencies in one file chunk.
+
+    Defined at module level so multiprocessing can pickle it on all platforms.
+    """
+    input_path, start, end, special_tokens_pattern, pat = args
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode("utf-8", errors="ignore")
+    local_counts: Counter = Counter()
+    for sub in re.split(special_tokens_pattern, chunk):
+        local_counts.update(re.findall(pat, sub))
+    return local_counts
+
+
 @dataclass
 class BPETokenizerParams():
     vocab: dict[int, bytes]
@@ -94,121 +110,198 @@ def merge_tokens(vocab: dict[int, bytes], indices: list[int], pair: tuple[bytes,
     return new_indices
 
 
-def counts_pairs_update(words_tokens: dict[str, list[int]],
-                        counts_words: dict[str, int],
-                        pairs_to_words: dict[tuple[bytes, bytes], set[str]], 
-                        counts_pairs: dict[tuple[bytes, bytes], int], 
-                        vocab: dict[int, bytes],
-                        pair: tuple[bytes, bytes],
-                        new_indice: int):
-    del counts_pairs[pair]
-
-    words_list = deepcopy(pairs_to_words[pair])
+def counts_pairs_update(
+        words_tokens: dict[str, list[int]],
+        counts_words: dict[str, int],
+        pairs_to_words: dict[tuple[bytes, bytes], set[str]],
+        counts_pairs: dict[tuple[bytes, bytes], int],
+        heap: list,
+        vocab: dict[int, bytes],
+        pair: tuple[bytes, bytes],
+        new_indice: int,
+) -> None:
+    """Merge *pair* into *new_indice* across all affected words, then update every
+    data structure (counts_pairs, pairs_to_words, words_tokens) and push fresh
+    heap entries for modified pairs (lazy-deletion heap; stale entries are
+    ignored when popped).
+    """
     pair0_bytes, pair1_bytes = pair
-    # pair0, pair1 = int(pair0_bytes), int(pair1_bytes)
     new_bytes = pair0_bytes + pair1_bytes
+
+    # Shallow copy is sufficient – we only need a snapshot of the word set.
+    words_list = set(pairs_to_words[pair])
+
+    # Remove the now-merged pair from all tracking structures.
+    del counts_pairs[pair]
+    del pairs_to_words[pair]
+
     for word in words_list:
         tokens = words_tokens[word]
-        new_tokens = []
+        freq = counts_words[word]
+        new_tokens: list[int] = []
         i = 0
-        while i < len(tokens)-1:
-            if vocab[tokens[i]] == pair0_bytes and vocab[tokens[i+1]] == pair1_bytes:
-                if i > 0:
-                    remove_pair = tuple([vocab[tokens[i-1]], pair0_bytes])
+
+        while i < len(tokens):
+            if (
+                i + 1 < len(tokens)
+                and vocab[tokens[i]] == pair0_bytes
+                and vocab[tokens[i + 1]] == pair1_bytes
+            ):
+                # ── left neighbour ──────────────────────────────────────────
+                # Use new_tokens[-1] (not tokens[i-1]) so that cascaded merges
+                # within the same word are handled correctly (e.g. "aaaa" → AA AA
+                # requires the second merge's left context to be AA, not a).
+                if new_tokens:
+                    left_bytes = vocab[new_tokens[-1]]
+
+                    remove_pair = (left_bytes, pair0_bytes)
                     if remove_pair in counts_pairs:
-                        counts_pairs[remove_pair] -= counts_words[word]
-                    add_pair = tuple([vocab[tokens[i-1]], new_bytes])
-                    counts_pairs[add_pair] += counts_words[word]
+                        counts_pairs[remove_pair] -= freq
+                        if counts_pairs[remove_pair] <= 0:
+                            del counts_pairs[remove_pair]
+                        else:
+                            heapq.heappush(heap, (-counts_pairs[remove_pair], remove_pair))
                     pairs_to_words[remove_pair].discard(word)
+
+                    add_pair = (left_bytes, new_bytes)
+                    counts_pairs[add_pair] += freq
+                    heapq.heappush(heap, (-counts_pairs[add_pair], add_pair))
                     pairs_to_words[add_pair].add(word)
-                    
-                if i < len(tokens)-2:
-                    remove_pair = tuple([pair1_bytes, vocab[tokens[i+2]]])
+
+                # ── right neighbour ─────────────────────────────────────────
+                if i + 2 < len(tokens):
+                    right_bytes = vocab[tokens[i + 2]]
+
+                    remove_pair = (pair1_bytes, right_bytes)
                     if remove_pair in counts_pairs:
-                        counts_pairs[remove_pair] -= counts_words[word]
-                    add_pair = tuple([new_bytes, vocab[tokens[i+2]]])
-                    counts_pairs[add_pair] += counts_words[word] 
+                        counts_pairs[remove_pair] -= freq
+                        if counts_pairs[remove_pair] <= 0:
+                            del counts_pairs[remove_pair]
+                        else:
+                            heapq.heappush(heap, (-counts_pairs[remove_pair], remove_pair))
                     pairs_to_words[remove_pair].discard(word)
+
+                    add_pair = (new_bytes, right_bytes)
+                    counts_pairs[add_pair] += freq
+                    heapq.heappush(heap, (-counts_pairs[add_pair], add_pair))
                     pairs_to_words[add_pair].add(word)
-                tokens[i+1] = new_indice
+
                 new_tokens.append(new_indice)
                 i += 2
             else:
                 new_tokens.append(tokens[i])
                 i += 1
-        if i == len(tokens)-1:
-            new_tokens.append(tokens[i])
+
         words_tokens[word] = new_tokens
-        # Re-add word to pairs_to_words for all pairs that still exist in new_tokens.
-        # This corrects premature discards: when processing one occurrence of a pair
-        # (e.g. (o,n) in 'condition'), the discard removes the word from
-        # pairs_to_words for that pair even if another occurrence remains elsewhere.
+
+        # Re-add word for every pair still present in new_tokens.  This corrects
+        # premature discards: when one occurrence of a pair is processed the word
+        # is discarded from pairs_to_words even if another occurrence remains.
         for j in range(len(new_tokens) - 1):
             remaining = (vocab[new_tokens[j]], vocab[new_tokens[j + 1]])
-            pairs_to_words[remaining].add(word)                   
+            pairs_to_words[remaining].add(word)
 
 
-def BPE_tokenizer_training(input_path, vocab_size, special_tokens):
-    counts_pairs = defaultdict(int)
-    pairs_to_words = defaultdict(set)
-    words_tokens = defaultdict(list)
-    counts_words = Counter()
-    ## Usage
+def BPE_tokenizer_training(input_path: str, vocab_size: int, special_tokens: list[str]) -> BPETokenizerParams:
+    """Train a BPE tokenizer on *input_path*.
+
+    Designed to handle gigabyte-scale corpora:
+    * Pre-tokenisation is parallelised across all CPU cores.
+    * Pair selection uses an O(log n) max-heap with lazy deletion instead of
+      an O(n) linear scan per merge step.
+    * Only word-frequency statistics are kept in memory (not the full token
+      sequence), so memory is proportional to vocabulary size, not file size.
+    """
+    num_processes = os.cpu_count() or 4
+    # Pattern that splits text on special tokens (used inside each worker too)
+    special_tokens_pattern = "|".join(re.escape(tok) for tok in special_tokens) if special_tokens else "$^"  # $^ never matches
+
+    # ── Step 1: count pre-token frequencies in parallel ───────────────────────
+    split_token = special_tokens[0].encode("utf-8") if special_tokens else b"\n"
     with open(input_path, "rb") as f:
-        num_processes = 4
-        boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
+        # Use more chunks than processes so slow chunks don't stall the pool.
+        boundaries = find_chunk_boundaries(f, num_processes * 4, split_token)
 
-        # The following is a serial implementation, but you can parallelize this
-        # by sending each start/end pair to a set of processes.
-        for start, end in zip(boundaries[:-1], boundaries[1:]):
-            f.seek(start)
-            chunk = f.read(end - start).decode("utf-8", errors="ignore")
-            # Run pre-tokenization on your chunk and store the counts for each pre-token
-            pattern = "|".join(re.escape(tok) for tok in SPECIAL_TOKENS)
-            splitted_chunks = re.split(pattern, chunk)
-            logger.info(f"number of splitted chunks: {len(splitted_chunks)}")
+    chunk_args = [
+        (input_path, start, end, special_tokens_pattern, PAT)
+        for start, end in zip(boundaries[:-1], boundaries[1:])
+    ]
 
-            for splitted_chunk in splitted_chunks:
-                # counts_words += Counter(splitted_chunk.split(" "))
-                counts_words += Counter(re.findall(PAT, splitted_chunk))
+    counts_words: Counter = Counter()
+    with multiprocessing.Pool(num_processes) as pool:
+        # imap_unordered yields results as each worker finishes, so only one
+        # partial Counter is held in the main process at a time instead of all
+        # num_chunks Counters simultaneously (saves ~10 GB for 11 GB corpora).
+        for partial_counts in pool.imap_unordered(_count_words_in_chunk, chunk_args):
+            counts_words.update(partial_counts)
 
-        for key, value in counts_words.items():
-            key_bytes = list(key.encode("utf-8"))
-            words_tokens[key] = key_bytes
-            for i in range(len(key_bytes)-1):
-                pairs = (bytes([key_bytes[i]]), bytes([key_bytes[i+1]]))
-                counts_pairs[pairs] += value
-                pairs_to_words[pairs].add(key)
-        logger.info(f"number of pairs: {len(counts_pairs)}")
-        f.seek(0)
-        indices = list(map(int, f.read()))
+    logger.info(f"Unique pre-tokens: {len(counts_words):,}")
 
+    # ── Step 2: build initial pair-count data structures ─────────────────────
+    counts_pairs: dict[tuple[bytes, bytes], int] = defaultdict(int)
+    pairs_to_words: dict[tuple[bytes, bytes], set[str]] = defaultdict(set)
+    words_tokens: dict[str, list[int]] = {}
 
-    assert vocab_size >= 256, "vocab should be >= 256"
-    merges: list[tuple[bytes, bytes]] = []
-    vocab: dict[int, bytes] = {x: bytes([x]) for x in range(256)}
+    for word, freq in counts_words.items():
+        token_ids = list(word.encode("utf-8"))
+        words_tokens[word] = token_ids
+        for i in range(len(token_ids) - 1):
+            pair = (bytes([token_ids[i]]), bytes([token_ids[i + 1]]))
+            counts_pairs[pair] += freq
+            pairs_to_words[pair].add(word)
+
+    logger.info(f"Unique initial pairs: {len(counts_pairs):,}")
+
+    # ── Step 3: max-heap for O(log n) best-pair selection (lazy deletion) ─────
+    # Stored as (-count, pair) so heapq (a min-heap) gives us the max-count pair.
+    heap: list[tuple[int, tuple[bytes, bytes]]] = [
+        (-count, pair) for pair, count in counts_pairs.items()
+    ]
+    heapq.heapify(heap)
+
+    # ── Step 4: initialise vocabulary ────────────────────────────────────────
+    assert vocab_size >= 256, "vocab_size must be >= 256"
+    vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
     next_id = 256
     for token in special_tokens:
         vocab[next_id] = token.encode("utf-8")
         next_id += 1
-    for i in range(vocab_size - 256 - len(special_tokens)):
-        if i > 0:
-            counts_pairs_update(words_tokens, counts_words, pairs_to_words, counts_pairs, vocab, pair, new_indice)
-        pair = max(counts_pairs, key= lambda x: (counts_pairs[x], x))
-        new_indice = 256 + len(special_tokens) + i
-        indices = merge_tokens(vocab, indices, pair, new_indice)
-        vocab[new_indice] = pair[0] + pair[1]
+
+    merges: list[tuple[bytes, bytes]] = []
+    num_merges = vocab_size - 256 - len(special_tokens)
+
+    # ── Step 5: BPE merge loop ────────────────────────────────────────────────
+    for i in range(num_merges):
+        # Pop from heap until we find an entry that still reflects the true count
+        # (lazy deletion: stale entries for pairs whose counts changed are skipped).
+        pair: tuple[bytes, bytes] | None = None
+        while heap:
+            neg_count, candidate = heapq.heappop(heap)
+            if candidate in counts_pairs and counts_pairs[candidate] == -neg_count:
+                pair = candidate
+                break
+
+        if pair is None:
+            logger.warning(f"No pairs remain after {i} merges; stopping early.")
+            break
+
+        new_id = 256 + len(special_tokens) + i
+        vocab[new_id] = pair[0] + pair[1]
         merges.append(pair)
-        logger.info(f"iteration {i}, pair: {pair}, count: {counts_pairs[pair]}")
+        logger.info(f"Merge {i + 1}/{num_merges}: {pair!r}  count={counts_pairs[pair]:,}")
+
+        counts_pairs_update(
+            words_tokens, counts_words, pairs_to_words, counts_pairs, heap, vocab, pair, new_id
+        )
 
     return BPETokenizerParams(vocab=vocab, merges=merges)
 
 
 if __name__ == "__main__":
-    # input_path = RAW_TEXT_PATH
-    input_path = "/Users/xshi849/Documents/playground/cs336-assignment1-Language-Modeling-From-Scratch/tests/fixtures/corpus.en"
+    input_path = RAW_TEXT_PATH
+    # input_path = "/Users/xshi849/Documents/playground/cs336-assignment1-Language-Modeling-From-Scratch/tests/fixtures/corpus.en"
     DATASET_NAME = input_path.split("/")[-1].split(".")[0]
-    vocab_size = 500
+    vocab_size = 10000
     special_tokens = SPECIAL_TOKENS
     BPE_params = BPE_tokenizer_training(input_path, vocab_size, special_tokens)
     
@@ -231,24 +324,8 @@ if __name__ == "__main__":
         for a, b in merges:
             f.write(f"{a.decode('utf-8', 'replace')} {b.decode('utf-8', 'replace')}\n")
 
-    # tokenize the whole text and save the tokenized version as a pickle file
-    with open(input_path, "rb") as f:
-        text = f.read().decode("utf-8", errors="ignore")
-        pattern = "|".join(re.escape(tok) for tok in SPECIAL_TOKENS)
-        splitted_chunks = re.split(pattern, text)
-        tokens = []
-        for splitted_chunk in splitted_chunks:
-            pretokens = []
-            for word in re.findall(PAT, splitted_chunk):
-                word_bytes = word.encode("utf-8")
-                word_tokens = [k for k in word_bytes]
-                pretokens.append(word_tokens)
-            for i in range(len(pretokens)):
-                for pair, new_id in zip(merges, range(256 + len(special_tokens), vocab_size)):
-                    pretokens[i] = merge_tokens(vocab, pretokens[i], pair, new_id)
-            tokens.extend([vocab[k] for pretoken in pretokens for k in pretoken])
-
-    # with open(f"{TRAINED_DATA_FOLDER}/{DATASET_NAME}_tokenized.pkl", "wb") as f:
-    #     pickle.dump(tokens, f)
+    # NOTE: For large corpora, use BPE_Tokenizer.encode() from bpe_tokenizer.py
+    # instead of re-tokenising here.  The naive loop below is O(vocab_size × tokens)
+    # and is impractical for GB-scale data.
 
     print("BPE tokenizer training completed and saved to disk.")
