@@ -1,3 +1,4 @@
+import io
 import os
 import regex as re
 import logging
@@ -83,6 +84,84 @@ def _count_words_in_chunk(args: tuple) -> Counter:
     with open(input_path, "rb") as f:
         f.seek(start)
         chunk = f.read(end - start).decode("utf-8", errors="ignore")
+    local_counts: Counter = Counter()
+    for sub in re.split(special_tokens_pattern, chunk):
+        local_counts.update(re.findall(pat, sub))
+    return local_counts
+
+
+# ── S3 helpers ────────────────────────────────────────────────────────────────
+
+def _is_s3(path: str) -> bool:
+    """Return True if *path* is an S3 URI (``s3://bucket/key``)."""
+    return path.startswith("s3://")
+
+
+def _parse_s3_uri(uri: str) -> tuple[str, str]:
+    """Parse ``s3://bucket/key/path`` into ``("bucket", "key/path")``."""
+    without_scheme = uri[5:]          # strip "s3://"
+    bucket, _, key = without_scheme.partition("/")
+    return bucket, key
+
+
+def find_chunk_boundaries_s3(
+    bucket: str,
+    key: str,
+    desired_num_chunks: int,
+    split_special_token: bytes,
+) -> list[int]:
+    """S3 equivalent of find_chunk_boundaries using byte-range GET requests.
+
+    Performs O(desired_num_chunks) tiny (4 KB) range requests to locate
+    split-token boundaries without downloading the full file.
+    """
+    try:
+        import boto3
+    except ImportError:
+        raise ImportError("boto3 is required for S3 support.  Run: pip install boto3")
+
+    s3 = boto3.client("s3")
+    file_size: int = s3.head_object(Bucket=bucket, Key=key)["ContentLength"]
+    chunk_size = file_size // desired_num_chunks
+    chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+    chunk_boundaries[-1] = file_size
+    mini_chunk_size = 4096
+
+    for bi in range(1, len(chunk_boundaries) - 1):
+        pos = chunk_boundaries[bi]
+        while pos < file_size:
+            end_byte = min(pos + mini_chunk_size - 1, file_size - 1)
+            resp = s3.get_object(Bucket=bucket, Key=key, Range=f"bytes={pos}-{end_byte}")
+            mini_chunk: bytes = resp["Body"].read()
+            if not mini_chunk:
+                chunk_boundaries[bi] = file_size
+                break
+            found_at = mini_chunk.find(split_special_token)
+            if found_at != -1:
+                chunk_boundaries[bi] = pos + found_at
+                break
+            pos += len(mini_chunk)
+        else:
+            chunk_boundaries[bi] = file_size
+
+    return sorted(set(chunk_boundaries))
+
+
+def _count_words_in_chunk_s3(args: tuple) -> Counter:
+    """Worker: count pre-token frequencies in one S3 file chunk.
+
+    Issues a single byte-range GET so no worker ever loads the full file.
+    Defined at module level so multiprocessing can pickle it on all platforms.
+    """
+    try:
+        import boto3
+    except ImportError:
+        raise ImportError("boto3 is required for S3 support.  Run: pip install boto3")
+
+    bucket, key, start, end, special_tokens_pattern, pat = args
+    s3 = boto3.client("s3")
+    resp = s3.get_object(Bucket=bucket, Key=key, Range=f"bytes={start}-{end - 1}")
+    chunk = resp["Body"].read().decode("utf-8", errors="ignore")
     local_counts: Counter = Counter()
     for sub in re.split(special_tokens_pattern, chunk):
         local_counts.update(re.findall(pat, sub))
@@ -218,21 +297,31 @@ def BPE_tokenizer_training(input_path: str, vocab_size: int, special_tokens: lis
 
     # ── Step 1: count pre-token frequencies in parallel ───────────────────────
     split_token = special_tokens[0].encode("utf-8") if special_tokens else b"\n"
-    with open(input_path, "rb") as f:
-        # Use more chunks than processes so slow chunks don't stall the pool.
-        boundaries = find_chunk_boundaries(f, num_processes * 4, split_token)
 
-    chunk_args = [
-        (input_path, start, end, special_tokens_pattern, PAT)
-        for start, end in zip(boundaries[:-1], boundaries[1:])
-    ]
+    if _is_s3(input_path):
+        s3_bucket, s3_key = _parse_s3_uri(input_path)
+        boundaries = find_chunk_boundaries_s3(s3_bucket, s3_key, num_processes * 4, split_token)
+        chunk_args = [
+            (s3_bucket, s3_key, start, end, special_tokens_pattern, PAT)
+            for start, end in zip(boundaries[:-1], boundaries[1:])
+        ]
+        worker_fn = _count_words_in_chunk_s3
+    else:
+        with open(input_path, "rb") as f:
+            # Use more chunks than processes so slow chunks don't stall the pool.
+            boundaries = find_chunk_boundaries(f, num_processes * 4, split_token)
+        chunk_args = [
+            (input_path, start, end, special_tokens_pattern, PAT)
+            for start, end in zip(boundaries[:-1], boundaries[1:])
+        ]
+        worker_fn = _count_words_in_chunk
 
     counts_words: Counter = Counter()
     with multiprocessing.Pool(num_processes) as pool:
         # imap_unordered yields results as each worker finishes, so only one
         # partial Counter is held in the main process at a time instead of all
         # num_chunks Counters simultaneously (saves ~10 GB for 11 GB corpora).
-        for partial_counts in pool.imap_unordered(_count_words_in_chunk, chunk_args):
+        for partial_counts in pool.imap_unordered(worker_fn, chunk_args):
             counts_words.update(partial_counts)
 
     logger.info(f"Unique pre-tokens: {len(counts_words):,}")
@@ -297,35 +386,73 @@ def BPE_tokenizer_training(input_path: str, vocab_size: int, special_tokens: lis
     return BPETokenizerParams(vocab=vocab, merges=merges)
 
 
+def save_bpe_params(params: BPETokenizerParams, output_dir: str, dataset_name: str) -> None:
+    """Write *params* to *output_dir* (local directory **or** ``s3://bucket/prefix/``).
+
+    Three files are written regardless of destination:
+
+    * ``<dataset_name>_bpe.pkl``    – full params as a pickle
+    * ``<dataset_name>_vocab.json`` – human-readable id → token string mapping
+    * ``<dataset_name>_merges.txt`` – GPT-2 style merge list
+    """
+    vocab, merges = params.vocab, params.merges
+
+    # Serialise into bytes first so the same code path works for both local
+    # writes and S3 uploads.
+    pkl_bytes = pickle.dumps(params)
+
+    vocab_readable = {
+        str(token_id): tok.decode("utf-8", "replace")
+        for token_id, tok in vocab.items()
+    }
+    vocab_json_bytes = json.dumps(vocab_readable, ensure_ascii=False, indent=2).encode("utf-8")
+
+    merge_lines = ["#version: 1.0\n"] + [
+        f"{a.decode('utf-8', 'replace')} {b.decode('utf-8', 'replace')}\n"
+        for a, b in merges
+    ]
+    merges_bytes = "".join(merge_lines).encode("utf-8")
+
+    files: dict[str, bytes] = {
+        f"{dataset_name}_bpe.pkl":    pkl_bytes,
+        f"{dataset_name}_vocab.json": vocab_json_bytes,
+        f"{dataset_name}_merges.txt": merges_bytes,
+    }
+
+    if _is_s3(output_dir):
+        try:
+            import boto3
+        except ImportError:
+            raise ImportError("boto3 is required for S3 support.  Run: pip install boto3")
+        s3 = boto3.client("s3")
+        bucket, prefix = _parse_s3_uri(output_dir)
+        prefix = prefix.rstrip("/") + "/" if prefix else ""
+        for filename, data in files.items():
+            s3_key = prefix + filename
+            s3.upload_fileobj(io.BytesIO(data), bucket, s3_key)
+            logger.info(f"Saved s3://{bucket}/{s3_key}")
+    else:
+        os.makedirs(output_dir, exist_ok=True)
+        for filename, data in files.items():
+            local_path = os.path.join(output_dir, filename)
+            with open(local_path, "wb") as f:
+                f.write(data)
+            logger.info(f"Saved {local_path}")
+
+
 if __name__ == "__main__":
+    # Both local paths and S3 URIs are accepted, e.g.:
+    #   input_path = "s3://my-bucket/data/owt_train.txt"
+    #   output_dir = "s3://my-bucket/trained/"
+    # The EC2 instance must have an IAM role (or ~/.aws/credentials) with
+    # s3:GetObject / s3:PutObject permissions on the relevant bucket.
     input_path = RAW_TEXT_PATH
-    # input_path = "/Users/xshi849/Documents/playground/cs336-assignment1-Language-Modeling-From-Scratch/tests/fixtures/corpus.en"
-    DATASET_NAME = input_path.split("/")[-1].split(".")[0]
+    output_dir = TRAINED_DATA_FOLDER
+
+    DATASET_NAME = input_path.rstrip("/").split("/")[-1].split(".")[0]
     vocab_size = 10000
     special_tokens = SPECIAL_TOKENS
+
     BPE_params = BPE_tokenizer_training(input_path, vocab_size, special_tokens)
-    
-    vocab = BPE_params.vocab
-    merges = BPE_params.merges
-
-    if not os.path.isdir(TRAINED_DATA_FOLDER):
-        os.mkdir(TRAINED_DATA_FOLDER)
-    with open(f"{TRAINED_DATA_FOLDER}/{DATASET_NAME}_bpe.pkl", "wb") as f:
-        pickle.dump(BPE_params, f)
-
-    # Human-readable vocab: token string → id
-    vocab_readable = {id: token.decode("utf-8", "replace") for id, token in vocab.items()}
-    with open(f"{TRAINED_DATA_FOLDER}/{DATASET_NAME}_vocab.json", "w", encoding="utf-8") as f:
-        json.dump(vocab_readable, f, ensure_ascii=False, indent=2)
-
-    # Human-readable merges: GPT-2 style, one merge per line
-    with open(f"{TRAINED_DATA_FOLDER}/{DATASET_NAME}_merges.txt", "w", encoding="utf-8") as f:
-        f.write("#version: 1.0\n")
-        for a, b in merges:
-            f.write(f"{a.decode('utf-8', 'replace')} {b.decode('utf-8', 'replace')}\n")
-
-    # NOTE: For large corpora, use BPE_Tokenizer.encode() from bpe_tokenizer.py
-    # instead of re-tokenising here.  The naive loop below is O(vocab_size × tokens)
-    # and is impractical for GB-scale data.
-
-    print("BPE tokenizer training completed and saved to disk.")
+    save_bpe_params(BPE_params, output_dir, DATASET_NAME)
+    print("BPE tokenizer training completed and saved.")
