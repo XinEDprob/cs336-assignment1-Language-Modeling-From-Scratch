@@ -1,0 +1,473 @@
+\documentclass[11pt,aspectratio=169]{beamer}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern,amsmath,amssymb,booktabs,array,listings}
+\definecolor{ink}{HTML}{172B4D}
+\definecolor{accent}{HTML}{007F86}
+\definecolor{muted}{HTML}{536477}
+\setbeamercolor{normal text}{fg=ink,bg=white}
+\setbeamercolor{frametitle}{fg=ink}
+\setbeamercolor{structure}{fg=accent}
+\setbeamercolor{alerted text}{fg=accent}
+\setbeamerfont{frametitle}{size=\Large,series=\bfseries}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{itemize items}[circle]
+\setbeamertemplate{footline}{\hfill\textcolor{muted}{\scriptsize\insertframenumber}\hspace{5mm}\par\vspace{3mm}}
+\setbeamersize{text margin left=9mm,text margin right=9mm}
+\setlength{\parskip}{5pt}
+\lstset{language=Python,basicstyle=\ttfamily\small,keywordstyle=\color{accent}\bfseries,commentstyle=\color{muted},showstringspaces=false,columns=fullflexible,keepspaces=true,breaklines=true,aboveskip=6pt,belowskip=6pt}
+\newcommand{\paper}[2]{\par{\scriptsize\color{muted}\href{#2}{#1}\par}}
+\newcommand{\shape}[1]{\textcolor{accent}{\ensuremath{#1}}}
+\title{Modern Language Modeling\\from Scratch}
+\subtitle{Byte-level BPE and a modern decoder-only Transformer}
+\date{30-minute technical presentation}
+\begin{document}
+
+% 01 -- 0:30
+\begin{frame}
+\par\vspace{8mm}
+{\huge\bfseries Modern Language Modeling\\[2mm]from Scratch\par}
+\par\vspace{6mm}
+{\large Byte-level BPE and a modern decoder-only Transformer\par}
+\par\vspace{5mm}
+\textcolor{muted}{30 minutes including discussion\quad\textbullet\quad Basic Python, tensors, and gradients}
+\end{frame}
+
+% 02 -- 1:00
+\begin{frame}{The language modeling problem}
+Given a prefix, predict a distribution over the next token.
+\[
+p_\theta(x_{1:T})=\prod_{t=1}^{T}p_\theta(x_t\mid x_{<t})
+\qquad
+\mathcal L=-\frac1T\sum_{t=1}^{T}\log p_\theta(x_t\mid x_{<t})
+\]
+\begin{itemize}
+\item The tokenizer defines the discrete symbols $x_t$.
+\item The Transformer converts a prefix into vocabulary logits.
+\item Training learns parameters. Generation repeatedly samples a next token.
+\end{itemize}
+\par\vspace{3mm}
+\alert{Talk route:} text encoding, the decoder implementation, then training and inference.\par
+27\,$\frac12$ minutes of slides and 2\,$\frac12$ minutes of discussion.
+\end{frame}
+
+% 03 -- 1:30
+\begin{frame}{Three different representations of language}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{.23\textwidth}>{\raggedright\arraybackslash}p{.67\textwidth}@{}}
+\toprule
+Representation & Example and meaning\\\midrule
+UTF-8 bytes & \texttt{caf\'e}: hexadecimal \texttt{63 61 66 C3 A9}. A Unicode character can occupy several bytes.\\[3mm]
+Token IDs & Integers indexing learned byte strings. A token can contain part of a character, a word, or punctuation.\\[3mm]
+Embedding vectors & $E[x_t]\in\mathbb R^d$. Learned continuous features, later updated by context.\\
+\bottomrule
+\end{tabular}\par
+\par\vspace{4mm}
+\alert{BPE learns compression-like segmentation. Neural training learns representations.}
+\end{frame}
+
+% 04 -- 1:00
+\begin{frame}{Tokenization choices change the modeling problem}
+\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{.18\textwidth}>{\raggedright\arraybackslash}p{.34\textwidth}>{\raggedright\arraybackslash}p{.39\textwidth}@{}}
+\toprule
+Choice & Benefit & Cost or distinction\\\midrule
+Whole words & Short sequences for common words & Large vocabulary, unseen-word handling\\[2mm]
+Characters & Small alphabet & Long sequences, Unicode alphabet choices\\[2mm]
+Raw bytes & 256 base symbols cover UTF-8 & Often longer sequences, especially across languages\\[2mm]
+Byte-level BPE & Byte coverage with frequent strings merged & Vocabulary size trades sequence length for embedding/output cost\\[2mm]
+Unigram model & Scores alternative segmentations & Different training and segmentation objective\\\bottomrule
+\end{tabular}\par
+\par\vspace{3mm}
+SentencePiece is a tokenizer toolkit supporting BPE and unigram models, rather than a single competing algorithm.
+\paper{Background: Sennrich et al. (2016), Kudo and Richardson (2018)}{https://arxiv.org/abs/1808.06226}
+\end{frame}
+
+% 05 -- 2:00
+\begin{frame}{BPE training: a small worked example}
+Illustrative corpus of pre-tokens: \texttt{low} occurs 3 times, \texttt{lower} 2 times.
+\[
+\texttt{l o w}\times3\qquad\texttt{l o w e r}\times2
+\]
+\begin{tabular}{@{}lll@{}}
+\toprule
+Step & Pair counts / choice & Resulting representations\\\midrule
+Initial & $(\texttt{l,o})=5$, $(\texttt{o,w})=5$ & Other pairs have count 2\\[2mm]
+Merge 1 & Choose $(\texttt{l,o})$ & \texttt{lo w}, \texttt{lo w e r}\\[2mm]
+Merge 2 & $(\texttt{lo,w})=5$ & \texttt{low}, \texttt{low e r}\\\bottomrule
+\end{tabular}\par
+\par\vspace{3mm}
+Every merge adds one byte string to the vocabulary and records its rank.\par
+This repository's heap breaks equal counts by \emph{ascending} byte-pair order.
+\end{frame}
+
+% 06 -- 1:30
+\begin{frame}{BPE training: the implementation behind the loop}
+\begin{itemize}
+\item Split around special tokens, then regex-pre-tokenize ordinary text. Count repeated pre-tokens with multiprocessing.
+\item Start with 256 byte entries and reserved special tokens.
+\item Store weighted pair counts and an inverted index from each pair to affected pre-tokens.
+\item Pop the highest count from a heap. Skip stale entries, merge, and update neighboring pair statistics.
+\end{itemize}
+\[
+C(a,b)=\sum_w f(w)\,\#\{\text{adjacent occurrences of }(a,b)\text{ in }w\}
+\]
+Memory depends on distinct pre-tokens, their lengths, indices, and heap entries. Each worker also holds its current text chunk.
+\end{frame}
+
+% 07 -- 1:30
+\begin{frame}[fragile]{Encoding replays learned merge priorities}
+\begin{lstlisting}
+ids = [reverse_vocab[bytes([b])] for b in word.encode("utf-8")]
+while an adjacent pair has a learned merge:
+    # Lowest rank means earliest merge learned during training.
+    i, rank = best_applicable_pair(ids)
+    ids[i] = merge_ids[rank]
+    del ids[i + 1]
+\end{lstlisting}
+\begin{itemize}
+\item Pseudocode above summarizes \texttt{\_encode\_word}. Encoding uses ranks, not new corpus counts or longest-match search.
+\item Cache each pre-token's result. Preserve special tokens as dedicated IDs.
+\item Decode by joining \emph{all bytes first}, then decoding UTF-8.
+\end{itemize}
+An individual token may be invalid UTF-8. Arbitrary token lists decode with replacement characters when bytes are invalid.
+\end{frame}
+
+% 08 -- 1:00
+\begin{frame}[fragile]{Token embeddings and the vocabulary projection}
+\[
+\underbrace{X}_{B\times T}\quad\longmapsto\quad
+\underbrace{E[X]}_{B\times T\times d}\quad\longmapsto\quad
+\underbrace{H}_{B\times T\times d}\quad\longmapsto\quad
+\underbrace{HW_{\rm out}^{\mathsf T}}_{B\times T\times V}
+\]
+\begin{lstlisting}
+# Embedding.forward
+return self.embeddings[x]      # E has shape (V, d)
+
+# LinearTransform.forward
+return x @ self.weight.T       # weight has shape (out, in)
+\end{lstlisting}
+\begin{itemize}
+\item IDs act as indices. Their numerical distance carries no semantic meaning.
+\item This implementation learns separate embedding and output matrices: $2Vd$ parameters. Weight tying would share them.
+\end{itemize}
+\end{frame}
+
+% 09 -- 1:00
+\begin{frame}{Where this architecture fits}
+\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{.20\textwidth}>{\raggedright\arraybackslash}p{.38\textwidth}>{\raggedright\arraybackslash}p{.33\textwidth}@{}}
+\toprule
+Architecture & Information access & Typical objective / use\\\midrule
+RNN language model & Sequential recurrent hidden state & Next-token prediction\\[3mm]
+Encoder Transformer & Bidirectional self-attention & Masked-token representation learning\\[3mm]
+Encoder--decoder & Bidirectional source, causal target with cross-attention & Conditional generation, translation\\[3mm]
+Decoder-only & Causal self-attention over one stream & Next-token prediction and continuation\\\bottomrule
+\end{tabular}\par
+\par\vspace{3mm}
+The original Transformer used an encoder and a decoder. This code implements only a causal decoder stack, with modern block components.
+\paper{Vaswani et al. (2017), Attention Is All You Need}{https://arxiv.org/abs/1706.03762}
+\end{frame}
+
+% 10 -- 1:00
+\begin{frame}[fragile]{The complete decoder stack}
+\begin{lstlisting}
+x = token_embeddings(token_ids)       # (B, T, d)
+for block in layers:
+    x = x + attention(rms_norm_1(x), positions)
+    x = x + swiglu(rms_norm_2(x))
+x = final_rms_norm(x)
+logits = lm_head(x)                   # (B, T, V)
+\end{lstlisting}
+\begin{itemize}
+\item Each sublayer preserves the residual shape $(B,T,d)$.
+\item Attention mixes information across positions. The feed-forward network operates independently at each position.
+\item Position enters attention through RoPE on queries and keys.
+\end{itemize}
+\end{frame}
+
+% 11 -- 1:30
+\begin{frame}{Pre-normalization and RMSNorm}
+\[
+\operatorname{RMSNorm}(x)_i
+=g_i\frac{x_i}{\sqrt{\frac1d\sum_{j=1}^d x_j^2+\epsilon}}
+\]
+\begin{itemize}
+\item Normalize along the feature axis. The learned scale $g$ starts at one.
+\item Unlike LayerNorm, RMSNorm does not subtract the mean or add a learned shift in this code.
+\item Compute the normalization in float32, then restore the input dtype.
+\end{itemize}
+\[
+\text{Pre-norm: }x+F(\operatorname{Norm}(x))
+\qquad\text{Post-norm: }\operatorname{Norm}(x+F(x))
+\]
+Pre-norm preserves an explicit identity path through each residual addition.
+\paper{Zhang and Sennrich (2019)}{https://arxiv.org/abs/1910.07467}
+\end{frame}
+
+% 12 -- 2:00
+\begin{frame}{Causal scaled dot-product attention}
+\[
+Q=XW_Q^{\mathsf T},\quad K=XW_K^{\mathsf T},\quad V=XW_V^{\mathsf T}
+\]
+\[
+A=\operatorname{softmax}_{\rm keys}\!\left(\frac{QK^{\mathsf T}}{\sqrt{d_h}}+M\right),
+\qquad O=AV
+\]
+\begin{columns}[T]
+\column{.58\textwidth}
+Queries ask what to retrieve. Keys determine relevance. Values carry the retrieved information.\par
+$1/\sqrt{d_h}$ controls score scale as head width grows.
+\column{.38\textwidth}
+\[
+M=\begin{pmatrix}
+0&-\infty&-\infty\\
+0&0&-\infty\\
+0&0&0
+\end{pmatrix}
+\]
+Position $t$ can read positions $\leq t$.
+\end{columns}
+\end{frame}
+
+% 13 -- 1:30
+\begin{frame}[fragile]{Multi-head attention: following the tensor axes}
+Use $B=2$, $T=4$, $d=512$, $H=8$, so $d_h=64$.
+\begin{lstlisting}
+Q = x @ weight_q.T                 # (2, 4, 512)
+Q = Q.view(B, T, H, d_h).transpose(1, 2)
+                                    # (2, 8, 4, 64)
+scores = Q @ K.transpose(-2, -1)    # (2, 8, 4, 4)
+out = softmax(scores / d_h**0.5, -1) @ V
+                                    # (2, 8, 4, 64)
+out = out.transpose(1, 2).contiguous().view(B, T, d)
+out = output_proj(out)              # (2, 4, 512)
+\end{lstlisting}
+The same triangular $(T,T)$ mask broadcasts across batches and heads.\par
+\alert{Required:} $d\bmod H=0$, with even $d_h$ for this RoPE implementation.
+\end{frame}
+
+% 14 -- 2:00
+\begin{frame}{RoPE: position as a rotation of queries and keys}
+For adjacent feature pair $i$, position $m$, and $\omega_i=\theta^{-2i/d_h}$:
+\[
+\begin{pmatrix}q'_{2i}\\q'_{2i+1}\end{pmatrix}
+=\begin{pmatrix}\cos(m\omega_i)&-\sin(m\omega_i)\\
+\sin(m\omega_i)&\cos(m\omega_i)\end{pmatrix}
+\begin{pmatrix}q_{2i}\\q_{2i+1}\end{pmatrix}
+\]
+\[
+(R_mq)^{\mathsf T}(R_nk)=q^{\mathsf T}R_{n-m}k
+\]
+\begin{itemize}
+\item Rotate $Q$ and $K$, leaving $V$ unchanged. Their dot product depends on relative displacement.
+\item Precompute sine/cosine tables as nonpersistent buffers. Slice even and odd features, rotate, then interleave.
+\item Learned absolute embeddings instead add a position vector to the input. RoPE does not guarantee extrapolation beyond training length.
+\end{itemize}
+\paper{Su et al., RoFormer (2021 preprint)}{https://arxiv.org/abs/2104.09864}
+\end{frame}
+
+% 15 -- 1:30
+\begin{frame}{SwiGLU: a gated feed-forward network}
+\[
+\operatorname{SwiGLU}(x)=W_3\left[\operatorname{SiLU}(W_1x)\odot W_2x\right]
+\qquad \operatorname{SiLU}(z)=z\,\sigma(z)
+\]
+Here $x$ is a column vector. The code applies these transforms to row vectors with transposed weights.
+\begin{itemize}
+\item Two projections expand width $d$ to $f$. Their elementwise product supplies an input-dependent gate.
+\item The final projection maps width $f$ back to $d$.
+\item Parameters: $3df$, versus $2df_{\rm ordinary}$ for a two-matrix ReLU/GELU FFN, ignoring biases.
+\end{itemize}
+Matching a conventional $f_{\rm ordinary}=4d$ gives $f\approx 8d/3$.\par
+\alert{Repository detail:} the CLI explicitly defaults to $f=2048$ at $d=512$. It overrides the module's automatic width selection.
+\paper{Shazeer (2020), GLU Variants Improve Transformer}{https://arxiv.org/abs/2002.05202}
+\end{frame}
+
+% 16 -- 1:00
+\begin{frame}{Original Transformer and this modern decoder}
+\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{.22\textwidth}>{\raggedright\arraybackslash}p{.32\textwidth}>{\raggedright\arraybackslash}p{.37\textwidth}@{}}
+\toprule
+Component & Original Transformer (2017) & This repository\\\midrule
+Structure & Encoder and decoder & Decoder only\\[2mm]
+Normalization & Post-LayerNorm & Pre-RMSNorm + final RMSNorm\\[2mm]
+Position & Sinusoidal input embeddings & Rotary queries and keys\\[2mm]
+Feed-forward & ReLU, two projections & SwiGLU, three projections\\[2mm]
+Attention & Multi-head + cross-attention & Causal multi-head self-attention\\[2mm]
+Other choices & Biases and dropout & Bias-free transforms, no dropout\\\bottomrule
+\end{tabular}\par
+\par\vspace{3mm}
+These block choices resemble LLaMA-style models. This is an educational implementation, not a full reproduction of a released model.
+\paper{Vaswani et al. (2017)}{https://arxiv.org/abs/1706.03762}
+\paper{Touvron et al. (2023), LLaMA, Section 2.2}{https://arxiv.org/abs/2302.13971}
+\end{frame}
+
+% 17 -- 1:00
+\begin{frame}[fragile]{Training examples and stable cross-entropy}
+\begin{lstlisting}
+x = tokens[s     : s + T]       # [A, B, C, D]
+y = tokens[s + 1 : s + T + 1]   # [B, C, D, E]
+logits = model(x)               # (B, T, V)
+loss = cross_entropy(logits.view(B*T, V), y.view(B*T))
+\end{lstlisting}
+\[
+\ell(z,y)=-z_y+m+\log\sum_j e^{z_j-m},\qquad m=\max_j z_j
+\]
+\begin{itemize}
+\item The causal mask lets all $T$ positions train in parallel without seeing their future targets.
+\item Subtract the maximum before exponentiation. Feed raw logits to the loss.
+\item Perplexity is $e^{\mathcal L}$ for natural-log loss. Compare token perplexities only under a matched tokenizer and evaluation setup.
+\end{itemize}
+\end{frame}
+
+% 18 -- 1:30
+\begin{frame}[fragile]{The training loop and its responsibilities}
+\begin{lstlisting}
+lr = warmup_then_cosine(iteration)
+x, y = get_batch(train_data, batch_size, context_length, device)
+optimizer.zero_grad()
+loss = cross_entropy(model(x).view(B*T, V), y.view(B*T))
+loss.backward()
+gradient_clipping(list(model.parameters()), max_norm)
+optimizer.step()
+\end{lstlisting}
+\begin{itemize}
+\item Custom AdamW tracks first and second gradient moments with bias correction and decoupled weight decay.
+\item Memory-map encoded data. Periodically evaluate held-out loss and save model/optimizer state.
+\item Fit the tokenizer on training text, then reuse it on validation text. Lower training loss alone does not establish generalization.
+\end{itemize}
+\end{frame}
+
+% 19 -- 1:00
+\begin{frame}{Autoregressive generation}
+\[
+z=\operatorname{model}(x_{\rm context})_{\rm last},\qquad
+p_i=\frac{\exp(z_i/\tau)}{\sum_j\exp(z_j/\tau)}
+\]
+\begin{itemize}
+\item Sample one ID, append it to the prefix, and run the model again.
+\item Temperature $\tau<1$ sharpens the distribution, $\tau>1$ flattens it. The code uses argmax when $\tau=0$.
+\item Optional top-$k$ keeps the highest logits before sampling.
+\item This code crops to the last context window and recomputes the entire prefix. It has no KV cache or end-of-text stopping rule.
+\end{itemize}
+\alert{Training is parallel across positions. Generation is sequential across new tokens.}
+\end{frame}
+
+% 20 -- 1:00
+\begin{frame}{Scaling variants address different bottlenecks}
+\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{.19\textwidth}>{\raggedright\arraybackslash}p{.40\textwidth}>{\raggedright\arraybackslash}p{.32\textwidth}@{}}
+\toprule
+Technique & What changes & Relation to this code\\\midrule
+KV cache & Store past keys and values during decoding & Avoids repeated prefix projections/FFNs\\[3mm]
+MQA / GQA & Share KV heads across query heads & Reduces KV cache size and bandwidth\\[3mm]
+FlashAttention & Tile exact attention to reduce memory traffic & Avoids materializing the full score matrix in device memory\\[3mm]
+Sparse attention & Limit which token pairs interact & Changes connectivity, may reduce attention work\\\bottomrule
+\end{tabular}\par
+\par\vspace{2mm}
+Current dense attention uses $O(BHT^2)$ score memory and $O(BT^2d)$ attention compute. None of these optimizations appears here.
+\paper{Ainslie et al. (2023), GQA}{https://arxiv.org/abs/2305.13245}
+\paper{Dao et al. (2022), FlashAttention}{https://arxiv.org/abs/2205.14135}
+\end{frame}
+
+% 21 -- 1:00
+\begin{frame}{Implementation details that deserve explicit checks}
+\begin{itemize}
+\item \textbf{BPE ties:} the heap selects lexicographically smaller byte pairs on equal counts. The assignment reference expects the larger pair. Match the chosen specification for reproducibility.
+\item \textbf{Head dimensions:} attention checks only $d_h>0$. Validate $d\bmod H=0$ and even $d_h$ before construction.
+\item \textbf{RoPE path:} a block supplies positions automatically. Calling attention directly without positions skips RoPE.
+\item \textbf{Data and checkpoints:} match raw-file dtype to the encoder's output. The script and utility module expose different checkpoint formats.
+\end{itemize}
+\par\vspace{2mm}
+The output projection has its own weights. A nearby comment claiming it shares the value projection is inaccurate.
+\end{frame}
+
+% 22 -- 0:30
+\begin{frame}{The complete model in one explanation}
+\large
+Byte-level BPE learns a reusable vocabulary and merge order.\par\par\vspace{3mm}
+A causal decoder contextualizes embeddings through RoPE attention and gated feed-forward layers.\par\par\vspace{3mm}
+Next-token cross-entropy trains the model. Repeated sampling turns its predictions into text.
+\par\vspace{5mm}
+\normalsize\alert{Discussion:} Which tensor changes if we double context length? Which parameter matrices change if we double vocabulary size?
+\end{frame}
+
+\appendix
+\begin{frame}{Backup: notation and parameter count}
+\small
+$B$: batch size, $T$: sequence length, $V$: vocabulary size, $d$: model width, $H$: head count, $d_h=d/H$, $f$: FFN width, $L$: layer count.
+\[
+N=2Vd+L(4d^2+3df+2d)+d
+\]
+\begin{itemize}
+\item $2Vd$: separate embedding and language model head.
+\item $4d^2$: query, key, value, and attention output projections per block.
+\item $3df$: SwiGLU weights. $2d$: two RMSNorm scales per block.
+\item Final RMSNorm contributes $d$. RoPE buffers are not parameters.
+\end{itemize}
+For the CLI defaults with illustrative $V=10{,}000$:\par
+$d=512$, $f=2048$, $H=8$, $L=6$ gives \textbf{35,412,480 parameters}.\par
+This is a calculated configuration, not a reported training result.
+\end{frame}
+
+\begin{frame}[fragile]{Backup: stable masked attention in the source}
+\begin{lstlisting}
+scores = Q @ K.transpose(-2, -1) / Q.shape[-1]**0.5
+scores = scores.masked_fill(~mask, float('-inf'))
+x_max = torch.max(scores, dim=-1, keepdim=True).values
+exp_x = torch.exp(scores - x_max)
+weights = exp_x / exp_x.sum(dim=-1, keepdim=True)
+return weights @ V
+\end{lstlisting}
+\begin{itemize}
+\item \texttt{True} means allowed in this implementation's boolean mask.
+\item Mask \emph{before} softmax. Multiplying probabilities by a mask afterward loses normalization unless renormalized.
+\item A fully masked row produces undefined values here. The causal mask includes the diagonal, so ordinary nonempty sequences avoid that case.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Backup: vocabulary and context have different costs}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{.26\textwidth}>{\raggedright\arraybackslash}p{.29\textwidth}>{\raggedright\arraybackslash}p{.34\textwidth}@{}}
+\toprule
+Quantity & Double $V$, fixed $T$ & Double $T$, fixed $V$\\\midrule
+Embedding/head params & $2\times$ & Unchanged\\[3mm]
+Output logits memory & $2\times$ & $2\times$\\[3mm]
+Attention score memory & Unchanged & $4\times$\\[3mm]
+FFN work & Unchanged & $2\times$\\\bottomrule
+\end{tabular}\par
+\par\vspace{4mm}
+Hold other dimensions fixed. In practice, a larger tokenizer vocabulary can shorten a given document's token sequence, coupling these costs.
+\end{frame}
+
+\begin{frame}{Backup: checks for a live code walkthrough}
+\begin{itemize}
+\item \textbf{Tokenizer round trip:} encode/decode valid text with whitespace, accented characters, emoji, and reserved tokens.
+\item \textbf{Causality:} change a suffix and confirm that logits at earlier positions stay unchanged, allowing numerical tolerance.
+\item \textbf{Shapes and gradients:} verify $(B,T,V)$ logits, finite loss, and finite gradients on a small batch.
+\item \textbf{Learning:} overfit a tiny batch, then evaluate separately on held-out data.
+\end{itemize}
+\par\vspace{4mm}
+These checks establish local behavior. A small model implementing the architecture does not establish large-model capabilities or instruction-following behavior.
+\end{frame}
+
+\begin{frame}{References: tokenization and architecture}
+\small
+\begin{itemize}
+\item Sennrich et al. (2016). \href{https://arxiv.org/abs/1508.07909}{Neural Machine Translation of Rare Words with Subword Units}.
+\item Kudo and Richardson (2018). \href{https://arxiv.org/abs/1808.06226}{SentencePiece}.
+\item Vaswani et al. (2017). \href{https://arxiv.org/abs/1706.03762}{Attention Is All You Need}.
+\item Zhang and Sennrich (2019). \href{https://arxiv.org/abs/1910.07467}{Root Mean Square Layer Normalization}.
+\item Shazeer (2020). \href{https://arxiv.org/abs/2002.05202}{GLU Variants Improve Transformer}.
+\item Su et al. (2021 preprint). \href{https://arxiv.org/abs/2104.09864}{RoFormer: Enhanced Transformer with Rotary Position Embedding}.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{References: modern decoder and efficient attention}
+\small
+\begin{itemize}
+\item Touvron et al. (2023). \href{https://arxiv.org/abs/2302.13971}{LLaMA: Open and Efficient Foundation Language Models}.
+\item Ainslie et al. (2023). \href{https://arxiv.org/abs/2305.13245}{GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints}.
+\item Dao et al. (2022). \href{https://arxiv.org/abs/2205.14135}{FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness}.
+\end{itemize}
+\end{frame}
+\end{document}
